@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ororo"
+dynamic = ["version"]
+description = "Download movies and shows made available by an ORORO subscription"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+
+[project.urls]
+Homepage = "https://github.com/levmv/ororo"
+
+[project.scripts]
+ororo = "ororo:main"
+
+[tool.setuptools]
+py-modules = ["ororo"]
+
+[tool.setuptools.dynamic]
+version = { attr = "ororo.VERSION" }
