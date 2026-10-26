@@ -353,6 +353,26 @@ class CommandTests(IsolatedTests):
         self.assertIn("ororo login", json_load(output)["error"])
         self.assertEqual(od.load_credentials(self.credentials), ("old@example.com", "old"))
 
+    def test_login_network_failure_is_reported_without_replacing_credentials(self):
+        od.save_credentials(self.credentials, "old@example.com", "old")
+
+        def timeout(*args, **kwargs):
+            self.assertIn("Verifying ORORO credentials", sys.stderr.getvalue())
+            raise TimeoutError("The read operation timed out")
+
+        with mock.patch.object(od, "urlopen", side_effect=timeout) as opener:
+            code, output, errors = self.cli(["login", "--json"], env=self.env_credentials)
+        self.assertEqual(code, 2)
+        self.assertEqual(opener.call_count, len(od.API_DOMAINS))
+        self.assertEqual(len(output.splitlines()), 1)
+        self.assertFalse(json_load(output)["ok"])
+        self.assertIn("HTTPS_PROXY", json_load(output)["error"])
+        for domain in od.API_DOMAINS:
+            self.assertIn(domain, json_load(output)["error"])
+        self.assertNotIn("demo-password", output + errors)
+        self.assertNotIn("saved credentials", errors)
+        self.assertEqual(od.load_credentials(self.credentials), ("old@example.com", "old"))
+
     def test_login_can_repair_a_malformed_file(self):
         self.credentials.write_text("[]", encoding="utf-8")
         api = mock.Mock()
@@ -782,12 +802,86 @@ class PlanningTests(IsolatedTests):
                     od.retry(operation, "test")
                 self.assertEqual(operation.call_count, attempts)
 
-    def test_api_falls_back_to_second_domain_after_transient_failures(self):
-        unavailable = od.HTTPError("https://example.test", 503, "busy", {}, None)
-        with mock.patch.object(od, "urlopen", side_effect=[unavailable, unavailable, unavailable, Response(b'{"movies": []}')]) as opener, mock.patch.object(od.time, "sleep"), contextlib.redirect_stderr(io.StringIO()):
-            result = od.OroroAPI("demo", "demo").catalog("movies")
-        self.assertEqual(result, [])
-        self.assertIn(od.API_DOMAINS[1], opener.call_args.args[0].full_url)
+
+class APITests(IsolatedTests):
+    def test_first_failure_switches_address_without_retries_or_delay(self):
+        failures = (
+            TimeoutError("The read operation timed out"),
+            od.URLError("offline"),
+            od.HTTPError("https://example.test", 503, "busy", {}, None),
+            od.HTTPError("https://example.test", 403, "blocked", {}, None),
+        )
+        for failure in failures:
+            errors = io.StringIO()
+            with self.subTest(error=str(failure)), mock.patch.object(
+                od, "urlopen", side_effect=[failure, Response(b'{"movies": []}')]
+            ) as opener, mock.patch.object(od.time, "sleep") as sleep, contextlib.redirect_stderr(errors):
+                api = od.OroroAPI("demo", "secret")
+                self.assertEqual(api.catalog("movies"), [])
+                self.assertEqual(
+                    [call.args[0].host for call in opener.call_args_list],
+                    list(od.API_DOMAINS[:2]),
+                )
+                self.assertTrue(all(call.kwargs["timeout"] == 10 for call in opener.call_args_list))
+                sleep.assert_not_called()
+                self.assertIn(od.API_DOMAINS[0], errors.getvalue())
+                self.assertIn(f"trying {od.API_DOMAINS[1]}", errors.getvalue())
+                self.assertNotIn("secret", errors.getvalue())
+                self.assertNotIn(api.authorization, errors.getvalue())
+
+    def test_successful_address_is_reused_for_subsequent_requests(self):
+        responses = [TimeoutError("offline"), Response(b'{"movies": []}'), Response(b'{"shows": []}')]
+        with mock.patch.object(od, "urlopen", side_effect=responses) as opener, contextlib.redirect_stderr(io.StringIO()):
+            api = od.OroroAPI("demo", "secret")
+            self.assertEqual(api.catalog("movies"), [])
+            self.assertEqual(api.catalog("shows"), [])
+        self.assertEqual(
+            [call.args[0].host for call in opener.call_args_list],
+            [od.API_DOMAINS[0], od.API_DOMAINS[1], od.API_DOMAINS[1]],
+        )
+
+    def test_all_addresses_are_attempted_once_and_reported_on_failure(self):
+        for preferred in (None, od.API_DOMAINS[2]):
+            with self.subTest(preferred=preferred), mock.patch.object(
+                od, "urlopen", side_effect=TimeoutError("offline")
+            ) as opener, mock.patch.object(od.time, "sleep") as sleep, contextlib.redirect_stderr(io.StringIO()):
+                api = od.OroroAPI("demo", "secret")
+                api.active_domain = preferred
+                with self.assertRaises(od.DownloadError) as raised:
+                    api.catalog("movies")
+                hosts = [call.args[0].host for call in opener.call_args_list]
+                self.assertCountEqual(hosts, od.API_DOMAINS)
+                self.assertEqual(hosts[0], preferred or od.API_DOMAINS[0])
+                for domain in od.API_DOMAINS:
+                    self.assertIn(f"{domain}: offline", str(raised.exception))
+                sleep.assert_not_called()
+
+    def test_auth_subscription_and_missing_item_errors_stop_immediately(self):
+        for status, error_type in ((401, od.AuthenticationError), (402, od.FatalError), (404, od.DownloadError)):
+            body = io.BytesIO(b"error")
+            failure = od.HTTPError("https://example.test", status, "rejected", {}, body)
+            with self.subTest(status=status), mock.patch.object(od, "urlopen", side_effect=failure) as opener:
+                with self.assertRaises(error_type):
+                    od.OroroAPI("demo", "secret").catalog("movies")
+                opener.assert_called_once()
+                self.assertTrue(body.closed)
+
+    def test_read_timeout_closes_response_and_tries_next_address(self):
+        response = Response()
+        response.read = mock.Mock(side_effect=TimeoutError("The read operation timed out"))
+        with mock.patch.object(od, "urlopen", side_effect=[response, Response(b'{"movies": []}')]) as opener, contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(od.OroroAPI("demo", "secret").catalog("movies"), [])
+        self.assertTrue(response.closed)
+        self.assertEqual(opener.call_count, 2)
+        self.assertEqual(opener.call_args.args[0].host, od.API_DOMAINS[1])
+
+    def test_invalid_json_response_falls_back_to_another_address(self):
+        for body in (b"<html>Unavailable</html>", b"[]"):
+            with self.subTest(body=body), mock.patch.object(
+                od, "urlopen", side_effect=[Response(body), Response(b'{"movies": []}')]
+            ) as opener, contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(od.OroroAPI("demo", "secret").catalog("movies"), [])
+                self.assertEqual(opener.call_count, 2)
 
 
 def json_load(value):

@@ -29,7 +29,7 @@ from urllib.parse import unquote, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 
-API_DOMAINS = ("front.ororo-mirror.tv", "front.ororo.tv")
+API_DOMAINS = ("front.ororo-mirror.tv", "ororo-mirror.tv", "front.ororo.tv", "ororo.tv")
 VERSION = "0.2.0"
 USER_AGENT = f"ororo/{VERSION}"
 CHUNK_SIZE = 1024 * 1024
@@ -337,7 +337,7 @@ def resolve_credentials(args: argparse.Namespace, *, login: bool = False) -> Cre
 
 
 class OroroAPI:
-    def __init__(self, user: str, password: str, timeout: float = 30) -> None:
+    def __init__(self, user: str, password: str, timeout: float = 10) -> None:
         token = base64.b64encode(f"{user}:{password}".encode()).decode()
         self.authorization = f"Basic {token}"
         self.timeout = timeout
@@ -349,8 +349,8 @@ class OroroAPI:
         if self.active_domain in domains:
             domains.remove(self.active_domain)
             domains.insert(0, self.active_domain)
-        last_error: Exception | None = None
-        for domain in domains:
+        errors: list[str] = []
+        for index, domain in enumerate(domains):
             request = Request(
                 f"https://{domain}/api/v2{path}",
                 headers={
@@ -360,27 +360,30 @@ class OroroAPI:
                 },
             )
             try:
-                def fetch():
-                    with urlopen(request, timeout=self.timeout) as response:
-                        return response.read()
-                body = retry(fetch, "ORORO API")
-                data = json.loads(body)
+                with urlopen(request, timeout=self.timeout) as response:
+                    data = json.loads(response.read())
                 if not isinstance(data, dict):
-                    raise DownloadError("ORORO returned an invalid JSON object")
+                    raise ValueError("ORORO returned an invalid JSON object")
                 self.active_domain = domain
                 return data
             except HTTPError as exc:
+                exc.close()
                 if exc.code == 401:
                     raise AuthenticationError("ORORO rejected the login or password") from exc
                 if exc.code == 402:
                     raise FatalError("ORORO says the subscription does not allow this request") from exc
-                if transient_error(exc):
-                    last_error = exc
-                    continue
-                raise DownloadError(f"ORORO API returned HTTP {exc.code} for {path}") from exc
+                # A public endpoint may reject the request at its proxy.
+                if exc.code != 403 and not transient_error(exc):
+                    raise DownloadError(f"ORORO API returned HTTP {exc.code} for {path}") from exc
+                error = f"HTTP {exc.code}"
             except (URLError, TimeoutError, OSError, ValueError, UnicodeError, http.client.HTTPException) as exc:
-                last_error = exc
-        raise DownloadError(f"could not reach the ORORO API: {last_error}")
+                error = str(exc) or type(exc).__name__
+            errors.append(f"{domain}: {error}")
+            if index + 1 < len(domains):
+                print(f"ORORO API {domain}: {error}; trying {domains[index + 1]}", file=sys.stderr, flush=True)
+        raise DownloadError(
+            f"could not reach the ORORO API: {'; '.join(errors)}; check network access or HTTPS_PROXY"
+        )
 
     def catalog(self, kind: str) -> list[dict]:
         catalog = self.catalogs.get(kind)
@@ -1295,6 +1298,7 @@ def run_command(
     api = OroroAPI(credentials.user, credentials.password)
     if command == "login" or credentials.prompted:
         # Validate before writing a password to disk.
+        print("Verifying ORORO credentials...", file=sys.stderr, flush=True)
         api.catalog(pages[0].kind if pages else "movies")
         save_credentials(credentials.path, credentials.user, credentials.password)
         print(f"saved credentials: {credentials.path}", file=sys.stderr)

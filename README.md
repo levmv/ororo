@@ -79,6 +79,9 @@ Delete the credentials file to forget an account.
 valid credentials fail with a readable error and a nonzero exit status.
 Environment variables may be visible to other processes under the same user.
 
+If the API is unreachable from your server, set `HTTPS_PROXY` to the URL of
+an available HTTP proxy.
+
 ## Settings
 
 Optional defaults are read from `~/.config/ororo/config.json` (respecting
